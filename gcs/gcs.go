@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/afero"
 	"github.com/spf13/afero/mem"
 
+	"google.golang.org/appengine/aetest"
 	"google.golang.org/cloud/storage"
 )
 
@@ -79,8 +80,27 @@ func (w writeableFile) Close() (err error) {
 	return err
 }
 
+type readableFile struct {
+	// *mem.File
+	r *storage.Reader
+	unfile
+	//unfile
+}
+
+func (w readableFile) Read(p []byte) (n int, err error) {
+	return w.r.Read(p)
+}
+
+func (w readableFile) Close() error {
+	return w.r.Close()
+}
+
 func (g gcs) createFile(filename string) (f afero.File, err error) {
-	wc := g.bucket.Object(filename).NewWriter(fakeContext{})
+	ctx, _, err := aetest.NewContext()
+	if err != nil {
+		return f, err
+	}
+	wc := g.bucket.Object(filename).NewWriter(ctx)
 	//	Attributes can be set on the object by modifying the returned Writer's
 	//	ObjectAttrs field before the first call to Write. If no ContentType
 	//	attribute is specified, the content type will be automatically sniffed using
@@ -95,6 +115,20 @@ func (g gcs) createFile(filename string) (f afero.File, err error) {
 	return writeableFile{
 		File: mem.NewFileHandle(memdata),
 		wc:   wc,
+	}, nil
+}
+
+func (g gcs) openFile(filename string) (f afero.File, err error) {
+	var r *storage.Reader
+	ctx, _, err := aetest.NewContext()
+	if err != nil {
+		return f, err
+	}
+	if r, err = g.bucket.Object(filename).NewReader(ctx); err != nil {
+		return f, err
+	}
+	return readableFile{
+		r: r,
 	}, nil
 }
 
@@ -118,8 +152,7 @@ func (g gcs) MkdirAll(path string, perm os.FileMode) (err error) {
 
 // Open opens a file, returning it or an error, if any happens.
 func (g gcs) Open(name string) (f afero.File, err error) {
-
-	return
+	return g.openFile(name)
 }
 
 // OpenFile opens a file using the given flags and the given mode.
@@ -178,9 +211,13 @@ func (f unfile) WriteAt(p []byte, off int64) (n int, err error) {
 	return
 }
 
+func (f unfile) Read(p []byte) (n int, err error) { return }
+
 func (f unfile) ReadAt(p []byte, off int64) (n int, err error) {
 	return
 }
+
+func (f unfile) Seek(offset int64, whence int) (n int64, err error) { return }
 
 //
 //
