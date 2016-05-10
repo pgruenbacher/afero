@@ -6,10 +6,12 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/net/context"
+
 	"github.com/spf13/afero"
 	"github.com/spf13/afero/mem"
 
-	"google.golang.org/appengine/aetest"
+	"google.golang.org/cloud"
 	"google.golang.org/cloud/storage"
 )
 
@@ -19,8 +21,25 @@ type storer interface {
 }
 
 type gcs struct {
+	ctx      context.Context
+	client   *storage.Client
 	bucket   *storage.BucketHandle
 	database storer
+}
+
+func New(project, bucket string) (*gcs, error) {
+	var err error
+	var scope = storage.ScopeFullControl
+	ctx := context.Background()
+	var client *storage.Client
+	if client, err = storage.NewClient(ctx, cloud.WithScopes(scope)); err != nil {
+		return nil, err
+	}
+	return &gcs{
+		ctx:    ctx,
+		client: client,
+		bucket: client.Bucket(bucket),
+	}, nil
 }
 
 type fakeContext struct{}
@@ -81,26 +100,32 @@ func (w writeableFile) Close() (err error) {
 }
 
 type readableFile struct {
-	// *mem.File
-	r *storage.Reader
-	unfile
+	*mem.File
+	attrs *storage.ObjectAttrs
+	//r     *storage.Reader
+	//unfile
 	//unfile
 }
 
-func (w readableFile) Read(p []byte) (n int, err error) {
-	return w.r.Read(p)
-}
-
-func (w readableFile) Close() error {
-	return w.r.Close()
+//func (w readableFile) Read(p []byte) (n int, err error) {
+//	return w.r.Read(p)
+//}
+//
+//func (w readableFile) Close() error {
+//	return w.r.Close()
+//}
+//
+func (r readableFile) Stat() (os.FileInfo, error) {
+	return GcsFileInfo{r.attrs}, nil
 }
 
 func (g gcs) createFile(filename string) (f afero.File, err error) {
-	ctx, _, err := aetest.NewContext()
-	if err != nil {
-		return f, err
-	}
-	wc := g.bucket.Object(filename).NewWriter(ctx)
+	//ctx, _, err := aetest.NewContext()
+	//ctx := context.Background()
+	//if err != nil {
+	//	return f, err
+	//}
+	wc := g.bucket.Object(filename).NewWriter(g.ctx)
 	//	Attributes can be set on the object by modifying the returned Writer's
 	//	ObjectAttrs field before the first call to Write. If no ContentType
 	//	attribute is specified, the content type will be automatically sniffed using
@@ -120,15 +145,32 @@ func (g gcs) createFile(filename string) (f afero.File, err error) {
 
 func (g gcs) openFile(filename string) (f afero.File, err error) {
 	var r *storage.Reader
-	ctx, _, err := aetest.NewContext()
+	//ctx, _, err := aetest.NewContext()
+	//ctx := context.Background()
+	if r, err = g.bucket.Object(filename).NewReader(g.ctx); err != nil {
+		return f, err
+	}
+	defer r.Close()
+	var attrs *storage.ObjectAttrs
+	if attrs, err = g.bucket.Object(filename).Attrs(g.ctx); err != nil {
+		return f, err
+	}
+	memdata, err := mem.CreateFile(filename), nil
 	if err != nil {
 		return f, err
 	}
-	if r, err = g.bucket.Object(filename).NewReader(ctx); err != nil {
+	memfile := mem.NewFileHandle(memdata)
+	//memfile.Open()
+	//var n int64
+	if _, err = io.Copy(memfile, r); err != nil {
 		return f, err
 	}
+	// have it open for reading
+	memfile.Open()
 	return readableFile{
-		r: r,
+		File:  memfile,
+		attrs: attrs,
+		//r:     r,
 	}, nil
 }
 
@@ -141,13 +183,13 @@ func (g gcs) Create(name string) (f afero.File, err error) {
 // Mkdir creates a directory in the filesystem, return an error if any
 // happens.
 func (g gcs) Mkdir(name string, perm os.FileMode) (err error) {
-	return
+	return nil
 }
 
 // MkdirAll creates a directory path and all parents that does not exist
 // yet.
 func (g gcs) MkdirAll(path string, perm os.FileMode) (err error) {
-	return
+	return nil
 }
 
 // Open opens a file, returning it or an error, if any happens.
@@ -157,13 +199,40 @@ func (g gcs) Open(name string) (f afero.File, err error) {
 
 // OpenFile opens a file using the given flags and the given mode.
 func (g gcs) OpenFile(name string, flag int, perm os.FileMode) (f afero.File, err error) {
-	return
+	//file, err := m.openWrite(name)
+	//if os.IsNotExist(err) && (flag&os.O_CREATE > 0) {
+	//	file, err = m.Create(name)
+	//}
+	//if err != nil {
+	//	return nil, err
+	//}
+	if flag == os.O_RDONLY {
+		//file = mem.NewReadOnlyFileHandle(file.(*mem.File).Data())
+		return g.openFile(name)
+	}
+	if flag&os.O_APPEND > 0 {
+		//_, err = file.Seek(0, os.SEEK_END)
+		//if err != nil {
+		//	file.Close()
+		//	return nil, err
+		//}
+	}
+	if flag&(os.O_CREATE|os.O_WRONLY) > 0 {
+		//err = file.Truncate(0)
+		//if err != nil {
+		//	file.Close()
+		//	return nil, err
+		//}
+		return g.createFile(name)
+	}
+	// else just return readable
+	return g.createFile(name)
 }
 
 // Remove removes a file identified by name, returning an error, if any
 // happens.
 func (g gcs) Remove(name string) (err error) {
-	return
+	return g.bucket.Object(name).Delete(g.ctx)
 }
 
 // RemoveAll removes a directory path and all any children it contains. It
@@ -177,15 +246,54 @@ func (g gcs) Rename(oldname, newname string) (err error) {
 	return
 }
 
+type GcsFileInfo struct {
+	attrs *storage.ObjectAttrs
+}
+
+func (i GcsFileInfo) Name() string {
+	return i.attrs.Name
+}
+
+func (i GcsFileInfo) Size() int64 {
+	return i.attrs.Size
+}
+
+func (i GcsFileInfo) Mode() os.FileMode {
+	return 0777
+}
+
+func (i GcsFileInfo) ModTime() time.Time {
+	return i.attrs.Updated
+}
+
+func (i GcsFileInfo) IsDir() bool {
+	return false
+}
+
+func (i GcsFileInfo) Sys() interface{} {
+	return nil
+}
+
 // Stat returns a FileInfo describing the named file, or an error, if any
 // happens.
 func (g gcs) Stat(name string) (info os.FileInfo, err error) {
-	return
+	attrs, err := g.bucket.Object(name).Attrs(g.ctx)
+	if err == storage.ErrObjectNotExist {
+		return nil, os.ErrNotExist
+	} else if err != nil {
+		return nil, err
+	}
+	return GcsFileInfo{
+		attrs,
+	}, nil
 }
 
 // The name of this FileSystem
+const Name = "Google-Cloud-Storage"
+
+// The name of this FileSystem
 func (g gcs) Name() (name string) {
-	return
+	return Name
 }
 
 //Chmod changes the mode of the named file to mode.
