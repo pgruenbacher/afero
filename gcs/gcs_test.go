@@ -116,6 +116,37 @@ func TestStat(t *testing.T) {
 	require.Equal(false, info.IsDir())
 }
 
+func TestReadDir(t *testing.T) {
+	// require := require.New(t)
+	var err error
+	var fs *gcs
+	if fs, err = getFs(); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.client.Close()
+	name := "folder2/test-readdir1.txt"
+	if err = fs.quickCreate(name); err != nil {
+		t.Fatal(err)
+	}
+	name = "folder2/test-readdir2.txt"
+	if err = fs.quickCreate(name); err != nil {
+		t.Fatal(err)
+	}
+	name = "folder2/nested-folder/test-readdir3.txt"
+	if err = fs.quickCreate(name); err != nil {
+		t.Fatal(err)
+	}
+	var f afero.File
+	f, err = fs.Open("folder2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.Readdir(-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 //func TestBuckets(t *testing.T) {
 //	var err error
 //	ctx, done, err := aetest.NewContext()

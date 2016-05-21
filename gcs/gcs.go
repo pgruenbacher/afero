@@ -99,6 +99,61 @@ func (w writeableFile) Close() (err error) {
 	return err
 }
 
+type folder struct {
+	name string
+	g    gcs
+	unfile
+	cursor *string
+}
+
+func (f folder) Stat() (os.FileInfo, error) {
+	// return empty objectAttrs
+	return GcsFileInfo{isFolder: true, attrs: new(storage.ObjectAttrs)}, nil
+}
+
+func (f folder) Readdir(count int) (info []os.FileInfo, err error) {
+	// 	Readdir reads the contents of the directory associated with file and returns a slice of up to n FileInfo values, as would be returned by Lstat, in directory order. Subsequent calls on the same file will yield further FileInfos.
+	// If n > 0, Readdir returns at most n FileInfo structures. In this case, if Readdir returns an empty slice, it will return a non-nil error explaining why. At the end of a directory, the error is io.EOF.
+	// If n <= 0, Readdir returns all the FileInfo from the directory in a single slice. In this case, if Readdir succeeds (reads all the way to the end of the directory), it returns the slice and a nil error. If it encounters an error before the end of the directory, Readdir returns the FileInfo read until that point and a non-nil error.
+
+	q := &storage.Query{
+		Prefix:     f.name,
+		MaxResults: count,
+		Versions:   false,
+	}
+	if f.cursor != nil {
+		q.Cursor = *f.cursor
+	}
+	var objectList *storage.ObjectList
+	if objectList, err = f.g.bucket.List(f.g.ctx, q); err != nil {
+		// fmt.Println("readdir errror", err)
+		return nil, os.ErrNotExist
+	}
+	// will allow for multiple readDirs
+	if objectList.Next != nil {
+		f.cursor = &objectList.Next.Cursor
+	}
+	infos := make([]GcsFileInfo, len(objectList.Results))
+	for i, obj := range objectList.Results {
+		// fmt.Println("RESULTS OBJ", obj.Name, obj.ContentType, obj.StorageClass)
+		infos[i] = GcsFileInfo{false, obj}
+	}
+	// fmt.Println("PREFIXS", objectList.Prefixes)
+	return
+}
+
+func (f folder) Readdirnames(n int) (s []string, err error) {
+	infos, err := f.Readdir(n)
+	if err != nil {
+		return s, err
+	}
+	s = make([]string, len(infos))
+	for i, info := range infos {
+		s[i] = info.Name()
+	}
+	return s, nil
+}
+
 type readableFile struct {
 	*mem.File
 	attrs *storage.ObjectAttrs
@@ -107,16 +162,8 @@ type readableFile struct {
 	//unfile
 }
 
-//func (w readableFile) Read(p []byte) (n int, err error) {
-//	return w.r.Read(p)
-//}
-//
-//func (w readableFile) Close() error {
-//	return w.r.Close()
-//}
-//
 func (r readableFile) Stat() (os.FileInfo, error) {
-	return GcsFileInfo{r.attrs}, nil
+	return GcsFileInfo{attrs: r.attrs}, nil
 }
 
 func (g gcs) createFile(filename string) (f afero.File, err error) {
@@ -143,11 +190,18 @@ func (g gcs) createFile(filename string) (f afero.File, err error) {
 	}, nil
 }
 
-func (g gcs) openFile(filename string) (f afero.File, err error) {
+func (g gcs) openFolder(path string) (f afero.File, err error) {
+	return folder{name: path, g: g}, nil
+}
+
+func (g gcs) open(filename string) (f afero.File, err error) {
 	var r *storage.Reader
 	//ctx, _, err := aetest.NewContext()
 	//ctx := context.Background()
-	if r, err = g.bucket.Object(filename).NewReader(g.ctx); err != nil {
+	if r, err = g.bucket.Object(filename).NewReader(g.ctx); err == storage.ErrObjectNotExist {
+		// if the file doesn't exist, then try returning it as a folder path
+		return g.openFolder(filename)
+	} else if err != nil {
 		return f, err
 	}
 	defer r.Close()
@@ -194,7 +248,7 @@ func (g gcs) MkdirAll(path string, perm os.FileMode) (err error) {
 
 // Open opens a file, returning it or an error, if any happens.
 func (g gcs) Open(name string) (f afero.File, err error) {
-	return g.openFile(name)
+	return g.open(name)
 }
 
 // OpenFile opens a file using the given flags and the given mode.
@@ -208,7 +262,7 @@ func (g gcs) OpenFile(name string, flag int, perm os.FileMode) (f afero.File, er
 	//}
 	if flag == os.O_RDONLY {
 		//file = mem.NewReadOnlyFileHandle(file.(*mem.File).Data())
-		return g.openFile(name)
+		return g.open(name)
 	}
 	if flag&os.O_APPEND > 0 {
 		//_, err = file.Seek(0, os.SEEK_END)
@@ -247,7 +301,8 @@ func (g gcs) Rename(oldname, newname string) (err error) {
 }
 
 type GcsFileInfo struct {
-	attrs *storage.ObjectAttrs
+	isFolder bool
+	attrs    *storage.ObjectAttrs
 }
 
 func (i GcsFileInfo) Name() string {
@@ -267,11 +322,21 @@ func (i GcsFileInfo) ModTime() time.Time {
 }
 
 func (i GcsFileInfo) IsDir() bool {
-	return false
+	return i.isFolder
 }
 
 func (i GcsFileInfo) Sys() interface{} {
 	return nil
+}
+
+func (g gcs) SignedUrl(path, email string, key []byte) (string, error) {
+	opts := &storage.SignedURLOptions{
+		GoogleAccessID: email,
+		PrivateKey:     key,
+		Method:         "GET",
+		Expires:        time.Now().Add(10 * time.Minute),
+	}
+	return storage.SignedURL(g.bucket, path, opts)
 }
 
 // Stat returns a FileInfo describing the named file, or an error, if any
@@ -284,7 +349,7 @@ func (g gcs) Stat(name string) (info os.FileInfo, err error) {
 		return nil, err
 	}
 	return GcsFileInfo{
-		attrs,
+		attrs: attrs,
 	}, nil
 }
 
@@ -309,7 +374,7 @@ func (g gcs) Chtimes(name string, atime time.Time, mtime time.Time) (err error) 
 type unfile struct {
 }
 
-func (f unfile) Close() { return }
+func (f unfile) Close() (err error) { return }
 
 func (f unfile) Write(p []byte) (n int, err error) {
 	return
